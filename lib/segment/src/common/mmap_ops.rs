@@ -27,12 +27,25 @@ pub fn open_read_mmap(path: &Path) -> OperationResult<Mmap> {
         .create(true)
         .open(path)?;
 
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let mut mmap_options = MmapOptions::new();
+
+    if let Ok(_) = std::env::var("MMAP_POPULATE") {
+        log::info!("Populating mmap {path:?} with MAP_POPULATE");
+        mmap_options.populate();
+    }
+
+    let mmap = unsafe { mmap_options.map(&file)? };
     madvise::madvise(&mmap, madvise::get_global())?;
 
     if let Ok(_) = std::env::var("MADVISE_WILL_NEED") {
         log::info!("Advising mmap {path:?} with MADV_WILL_NEED");
         madvise::madvise(&mmap, madvise::Advice::WillNeed)?;
+    }
+
+    if let Ok(_) = std::env::var("MADVISE_READ_BYTE") {
+        log::info!("Reading first byte of mmap {path:?} with MADVISE_READ_BYTE");
+        let b = mmap[0];
+        log::info!("First byte is: {}", b);
     }
 
     Ok(mmap)
@@ -45,12 +58,25 @@ pub fn open_write_mmap(path: &Path) -> OperationResult<MmapMut> {
         .create(false)
         .open(path)?;
 
-    let mmap = unsafe { MmapMut::map_mut(&file)? };
+    let mut mmap_options = MmapOptions::new();
+
+    if let Ok(_) = std::env::var("MMAP_POPULATE") {
+        log::info!("Populating mmap {path:?} with MAP_POPULATE");
+        mmap_options.populate();
+    }
+
+    let mmap = unsafe { mmap_options.map_mut(&file)? };
     madvise::madvise(&mmap, madvise::get_global())?;
 
     if let Ok(_) = std::env::var("MADVISE_WILL_NEED") {
         log::info!("Advising mmap {path:?} with MADV_WILL_NEED");
         madvise::madvise(&mmap, madvise::Advice::WillNeed)?;
+    }
+
+    if let Ok(_) = std::env::var("MADVISE_READ_BYTE") {
+        log::info!("Reading first byte of mmap {path:?} with MADVISE_READ_BYTE");
+        let b = mmap[0];
+        log::info!("First byte is: {}", b);
     }
 
     Ok(mmap)
