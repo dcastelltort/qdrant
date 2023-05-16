@@ -29,6 +29,12 @@ pub fn open_read_mmap(path: &Path) -> OperationResult<Mmap> {
 
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     madvise::madvise(&mmap, madvise::get_global())?;
+
+    if let Ok(_) = std::env::var("MADVISE_WILL_NEED") {
+        log::info!("Advising mmap {path:?} with MADV_WILL_NEED");
+        madvise::madvise(&mmap, madvise::Advice::WillNeed)?;
+    }
+
     Ok(mmap)
 }
 
@@ -41,6 +47,12 @@ pub fn open_write_mmap(path: &Path) -> OperationResult<MmapMut> {
 
     let mmap = unsafe { MmapMut::map_mut(&file)? };
     madvise::madvise(&mmap, madvise::get_global())?;
+
+    if let Ok(_) = std::env::var("MADVISE_WILL_NEED") {
+        log::info!("Advising mmap {path:?} with MADV_WILL_NEED");
+        madvise::madvise(&mmap, madvise::Advice::WillNeed)?;
+    }
+
     Ok(mmap)
 }
 
