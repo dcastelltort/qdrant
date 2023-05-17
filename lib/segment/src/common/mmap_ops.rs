@@ -1,11 +1,14 @@
-use std::fs::OpenOptions;
+use std::env;
+use std::fs::{File, OpenOptions};
 use std::mem;
 use std::mem::size_of;
+use std::ops;
 use std::path::Path;
+use std::time;
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
-use crate::entry::entry_point::OperationResult;
+use crate::{entry::entry_point::{OperationResult, OperationError}, madvise::Madviseable};
 use crate::madvise;
 
 pub fn create_and_ensure_length(path: &Path, length: usize) -> OperationResult<()> {
@@ -27,28 +30,7 @@ pub fn open_read_mmap(path: &Path) -> OperationResult<Mmap> {
         .create(true)
         .open(path)?;
 
-    let mut mmap_options = MmapOptions::new();
-
-    if let Ok(_) = std::env::var("MMAP_POPULATE") {
-        log::info!("Populating mmap {path:?} with MAP_POPULATE");
-        mmap_options.populate();
-    }
-
-    let mmap = unsafe { mmap_options.map(&file)? };
-    madvise::madvise(&mmap, madvise::get_global())?;
-
-    if let Ok(_) = std::env::var("MADVISE_WILL_NEED") {
-        log::info!("Advising mmap {path:?} with MADV_WILL_NEED");
-        madvise::madvise(&mmap, madvise::Advice::WillNeed)?;
-    }
-
-    if let Ok(_) = std::env::var("MADVISE_READ_BYTE") {
-        log::info!("Reading first byte of mmap {path:?} with MADVISE_READ_BYTE");
-        let b = mmap[0];
-        log::info!("First byte is: {}", b);
-    }
-
-    Ok(mmap)
+    open_mmap(path, &file, |file, opts| unsafe { opts.map(file) })
 }
 
 pub fn open_write_mmap(path: &Path) -> OperationResult<MmapMut> {
@@ -58,26 +40,81 @@ pub fn open_write_mmap(path: &Path) -> OperationResult<MmapMut> {
         .create(false)
         .open(path)?;
 
-    let mut mmap_options = MmapOptions::new();
+    open_mmap(path, &file, |file, opts| unsafe { opts.map_mut(file) })
+}
 
-    if let Ok(_) = std::env::var("MMAP_POPULATE") {
-        log::info!("Populating mmap {path:?} with MAP_POPULATE");
-        mmap_options.populate();
+fn open_mmap<F, T, E>(path: &Path, file: &File, open: F) -> OperationResult<T>
+where
+    F: FnOnce(&File, &MmapOptions) -> Result<T, E>,
+    T: ops::Deref<Target = [u8]> + Madviseable,
+    OperationError: From<E>,
+{
+    let mut opts = MmapOptions::new();
+
+    if let Ok(_) = env::var("MAP_POPULATE") {
+        log::info!("Loading mmap {path:?} with MAP_POPULATE");
+        opts.populate();
     }
 
-    let mmap = unsafe { mmap_options.map_mut(&file)? };
-    madvise::madvise(&mmap, madvise::get_global())?;
+    let instant = time::Instant::now();
+    let mmap = open(&file, &opts)?;
+    log::info!("Loading mmap {path:?} took {:?}", instant.elapsed());
 
-    if let Ok(_) = std::env::var("MADVISE_WILL_NEED") {
-        log::info!("Advising mmap {path:?} with MADV_WILL_NEED");
+    if let Ok(_) = env::var("MADV_WILLNEED")
+        .or_else(|_| env::var("MADV_WILLNEED_FIRST"))
+        .or_else(|_| env::var("MADV_WILLNEED_SPARSE")) {
+
+        log::info!("Advising mmap {path:?} with MADV_WILLNEED");
+
         madvise::madvise(&mmap, madvise::Advice::WillNeed)?;
+
+        if let Ok(_) = env::var("MADV_WILLNEED_FIRST") {
+            log::info!("Reading the first byte of mmap {path:?} to force page read-ahead");
+            let instant = time::Instant::now();
+            let _ = mmap[0];
+            log::info!("Reading the first byte of mmap {path:?} took {:?}", instant.elapsed());
+        } else if let Ok(_) = env::var("MADV_WILLNEED_SPARSE") {
+            log::info!("Making 10 sparse reads of mmap {path:?} to force page read-ahead");
+
+            let mut timings = Vec::with_capacity(9);
+
+            for iter in 0..10 {
+                let index = mmap.len() / 11 * iter;
+
+                let instant = time::Instant::now();
+                let _ = mmap[index];
+                timings.push(instant.elapsed());
+            }
+
+            log::info!("Sparse reads of mmap {path:?} took {timings:?}");
+        }
     }
 
-    if let Ok(_) = std::env::var("MADVISE_READ_BYTE") {
-        log::info!("Reading first byte of mmap {path:?} with MADVISE_READ_BYTE");
-        let b = mmap[0];
-        log::info!("First byte is: {}", b);
+    if let Ok(_) = env::var("MMAP_READ_ALL") {
+        log::info!("Reading mmap {path:?} (size: {} bytes) to populate caches", mmap.len());
+
+        let mut dst = vec![0; 8096];
+
+        let instant = time::Instant::now();
+
+        for iter in 0..(mmap.len() / dst.len()) {
+            let start = dst.len() * iter;
+            let end = start + dst.len();
+
+            dst.copy_from_slice(&mmap[start..end]);
+        }
+
+        let rem = mmap.len() % dst.len();
+        let start = mmap.len() - rem;
+
+        if rem > 0 {
+            dst[..rem].copy_from_slice(&mmap[start..]);
+        }
+
+        log::info!("Reading mmap {path:?} took {:?}", instant.elapsed());
     }
+
+    madvise::madvise(&mmap, madvise::get_global())?;
 
     Ok(mmap)
 }
