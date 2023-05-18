@@ -236,6 +236,8 @@ impl LocalShard {
 
         collection.load_from_wal(collection_id)?;
 
+        // TODO: Schedule mmap disk-cache preheat for all loaded segments backed by memmaped storage!
+
         Ok(collection)
     }
 

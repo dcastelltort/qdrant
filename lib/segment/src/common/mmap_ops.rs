@@ -1,7 +1,7 @@
 use std::fs::OpenOptions;
 use std::mem::size_of;
 use std::path::Path;
-use std::{env, mem, ops, time};
+use std::{mem, ops, time};
 
 use memmap2::{Mmap, MmapMut};
 
@@ -31,10 +31,6 @@ pub fn open_read_mmap(path: &Path) -> OperationResult<Mmap> {
     let mmap = unsafe { Mmap::map(&file)? };
     madvise::madvise(&mmap, madvise::get_global())?;
 
-    if let Ok(_) = env::var("MMAP_POPULATE_CACHES") {
-        populate_cache(&mmap, Some(path))?;
-    }
-
     Ok(mmap)
 }
 
@@ -48,24 +44,17 @@ pub fn open_write_mmap(path: &Path) -> OperationResult<MmapMut> {
     let mmap = unsafe { MmapMut::map_mut(&file)? };
     madvise::madvise(&mmap, madvise::get_global())?;
 
-    if let Ok(_) = env::var("MMAP_POPULATE_CACHES") {
-        populate_cache(&mmap, Some(path))?;
-    }
-
     Ok(mmap)
 }
 
-pub fn populate_cache<T>(mmap: &T, path: Option<&Path>) -> OperationResult<()>
+fn preheat_disk_cache<T>(mmap: &T, path: Option<&Path>)
 where
     T: Madviseable + ops::Deref<Target = [u8]>,
 {
-    log::debug!(
-        "Reading mmap{}{:?} to populate cache...",
-        path.map_or("", |_| " "),
-        path.unwrap_or(Path::new("")),
-    );
+    let separator = path.map_or("", |_| " "); // space if `path` is `Some` or nothing
+    let path = path.unwrap_or(Path::new("")); // path if `path` is `Some` or nothing
 
-    madvise::madvise(mmap, madvise::Advice::WillNeed)?;
+    log::debug!("Reading mmap{separator}{path:?} to populate cache...");
 
     let instant = time::Instant::now();
 
@@ -86,15 +75,9 @@ where
     }
 
     log::debug!(
-        "Reading mmap{}{:?} to populate cache took {:?}",
-        path.map_or("", |_| " "),
-        path.unwrap_or(Path::new("")),
-        instant.elapsed(),
+        "Reading mmap{separator}{path:?} to populate cache took {:?}",
+        instant.elapsed()
     );
-
-    madvise::madvise(mmap, madvise::get_global())?;
-
-    Ok(())
 }
 
 pub fn transmute_to_u8<T>(v: &T) -> &[u8] {

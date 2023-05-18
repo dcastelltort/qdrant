@@ -221,9 +221,10 @@ impl UpdateHandler {
 
                     handles.push(spawn_stoppable(move |stopped| {
                         match optim.as_ref().optimize(segs.clone(), nsi, stopped) {
-                            Ok(result) => {
-                                callback_cloned(result); // Perform some actions when optimization if finished
-                                result
+                            Ok(optimized_segment_id) => {
+                                // TODO: Schedule mmap disk-cache preheat, if optimized segment is backed by memmaped storage!
+                                callback_cloned(optimized_segment_id.is_some()); // Perform some actions when optimization if finished
+                                optimized_segment_id.is_some()
                             }
                             Err(error) => match error {
                                 CollectionError::Cancelled { description } => {
