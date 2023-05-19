@@ -55,7 +55,7 @@ pub struct PreheatDiskCacheWorker {
 
 impl PreheatDiskCacheWorker {
     pub fn spawn() -> PreheatDiskCacheHandle {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(32);
 
         let handle = PreheatDiskCacheHandle { sender };
 
@@ -74,7 +74,7 @@ impl PreheatDiskCacheWorker {
 
 #[derive(Clone, Debug)]
 pub struct PreheatDiskCacheHandle {
-    sender: mpsc::Sender<PreheatDiskCache>,
+    sender: mpsc::SyncSender<PreheatDiskCache>,
 }
 
 impl PreheatDiskCacheHandle {

@@ -80,16 +80,16 @@ pub struct UpdateHandler {
     flush_worker: Option<JoinHandle<()>>,
     /// Sender to stop flush worker
     flush_stop: Option<oneshot::Sender<()>>,
-    /// TODO
-    preheat_disk_cache_worker: Option<mmap_ops::PreheatDiskCacheHandle>,
     runtime_handle: Handle,
     /// WAL, required for operations
     wal: LockedWal,
     optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
     max_optimization_threads: usize,
+    preheat_disk_cache_worker: Option<mmap_ops::PreheatDiskCacheHandle>,
 }
 
 impl UpdateHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         shared_storage_config: Arc<SharedStorageConfig>,
         optimizers: Arc<Vec<Arc<Optimizer>>>,
@@ -98,6 +98,7 @@ impl UpdateHandler {
         wal: LockedWal,
         flush_interval_sec: u64,
         max_optimization_threads: usize,
+        preheat_disk_cache_worker: Option<mmap_ops::PreheatDiskCacheHandle>,
     ) -> UpdateHandler {
         UpdateHandler {
             shared_storage_config,
@@ -107,12 +108,12 @@ impl UpdateHandler {
             optimizer_worker: None,
             flush_worker: None,
             flush_stop: None,
-            preheat_disk_cache_worker: None,
             runtime_handle,
             wal,
             flush_interval_sec,
             optimization_handles: Arc::new(TokioMutex::new(vec![])),
             max_optimization_threads,
+            preheat_disk_cache_worker,
         }
     }
 
@@ -142,7 +143,6 @@ impl UpdateHandler {
             flush_rx,
         )));
         self.flush_stop = Some(flush_tx);
-        self.preheat_disk_cache_worker = Some(mmap_ops::PreheatDiskCacheWorker::spawn());
     }
 
     pub fn stop_flush_worker(&mut self) {
@@ -293,6 +293,7 @@ impl UpdateHandler {
         handles.retain(|h| !h.is_finished())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn optimization_worker_fn(
         optimizers: Arc<Vec<Arc<Optimizer>>>,
         sender: Sender<OptimizerSignal>,
@@ -470,14 +471,36 @@ impl UpdateHandler {
             Some(failed_operation) => min(failed_operation, flushed_version),
         })
     }
+
+    pub fn schedule_preheat_disk_cache_tasks(&self) {
+        let preheat_disk_cache_worker = match &self.preheat_disk_cache_worker {
+            Some(worker) => worker,
+            None => return,
+        };
+
+        let segments = self.segments.read();
+
+        for (_, segment) in segments.iter() {
+            let segment = match segment {
+                LockedSegment::Original(segment) => segment,
+                _ => continue,
+            };
+
+            for task in segment.read().preheat_disk_cache() {
+                if let Err(err) = preheat_disk_cache_worker.schedule(task) {
+                    log::error!("{err}");
+                }
+            }
+        }
+    }
 }
 
 fn schedule_preheat_disk_cache_task(
     segments: &LockedSegmentHolder,
     preheat_disk_cache_worker: Option<mmap_ops::PreheatDiskCacheHandle>,
-    optimized_segment_id: Option<SegmentId>,
+    segment_id: Option<SegmentId>,
 ) {
-    let optimized_segment_id = match optimized_segment_id {
+    let segment_id = match segment_id {
         Some(id) => id,
         None => return,
     };
@@ -487,16 +510,16 @@ fn schedule_preheat_disk_cache_task(
         None => return,
     };
 
-    let optimized_segment = {
+    let segment = {
         let segments = segments.read();
 
-        match segments.get(optimized_segment_id) {
+        match segments.get(segment_id) {
             Some(LockedSegment::Original(segment)) => segment.clone(),
             _ => return,
         }
     };
 
-    for task in optimized_segment.read().preheat_disk_cache() {
+    for task in segment.read().preheat_disk_cache() {
         if let Err(err) = preheat_disk_cache_worker.schedule(task) {
             log::error!("{err}");
         }

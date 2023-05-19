@@ -100,6 +100,7 @@ fn batch_search_bench(c: &mut Criterion) {
             shared_config,
             Default::default(),
             handle.clone(),
+            None,
         ))
         .unwrap();
 
