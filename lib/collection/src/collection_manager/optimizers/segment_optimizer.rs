@@ -476,7 +476,7 @@ pub trait SegmentOptimizer {
             error
         })?;
 
-        {
+        let optimized_segment_id = {
             // This block locks all operations with collection. It should be fast
             let mut write_segments_guard = segments.write();
             let deleted_points = proxy_deleted_points.read();
@@ -539,7 +539,10 @@ pub trait SegmentOptimizer {
                 }
                 tmp_segment.drop_data()?;
             }
-        }
+
+            optimized_segment_id
+        };
+
         timer.set_success(true);
         Ok(Some(optimized_segment_id))
     }

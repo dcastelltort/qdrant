@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use log::{debug, error, info, trace, warn};
+use segment::common::mmap_ops;
 use segment::entry::entry_point::OperationResult;
 use segment::types::SeqNumberType;
 use tokio::runtime::Handle;
@@ -13,7 +14,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 use crate::collection_manager::collection_updater::CollectionUpdater;
-use crate::collection_manager::holders::segment_holder::LockedSegmentHolder;
+use crate::collection_manager::holders::segment_holder::{
+    LockedSegment, LockedSegmentHolder, SegmentId,
+};
 use crate::collection_manager::optimizers::segment_optimizer::SegmentOptimizer;
 use crate::common::stoppable_task::{spawn_stoppable, StoppableTaskHandle};
 use crate::operations::shared_storage_config::SharedStorageConfig;
@@ -77,6 +80,8 @@ pub struct UpdateHandler {
     flush_worker: Option<JoinHandle<()>>,
     /// Sender to stop flush worker
     flush_stop: Option<oneshot::Sender<()>>,
+    /// TODO
+    preheat_disk_cache_worker: Option<mmap_ops::PreheatDiskCacheHandle>,
     runtime_handle: Handle,
     /// WAL, required for operations
     wal: LockedWal,
@@ -102,6 +107,7 @@ impl UpdateHandler {
             optimizer_worker: None,
             flush_worker: None,
             flush_stop: None,
+            preheat_disk_cache_worker: None,
             runtime_handle,
             wal,
             flush_interval_sec,
@@ -117,6 +123,7 @@ impl UpdateHandler {
             tx.clone(),
             rx,
             self.segments.clone(),
+            self.preheat_disk_cache_worker.clone(),
             self.wal.clone(),
             self.optimization_handles.clone(),
             self.max_optimization_threads,
@@ -135,6 +142,7 @@ impl UpdateHandler {
             flush_rx,
         )));
         self.flush_stop = Some(flush_tx);
+        self.preheat_disk_cache_worker = Some(mmap_ops::PreheatDiskCacheWorker::spawn());
     }
 
     pub fn stop_flush_worker(&mut self) {
@@ -195,6 +203,7 @@ impl UpdateHandler {
     pub(crate) fn launch_optimization<F>(
         optimizers: Arc<Vec<Arc<Optimizer>>>,
         segments: LockedSegmentHolder,
+        preheat_disk_cache_worker: Option<mmap_ops::PreheatDiskCacheHandle>,
         callback: F,
     ) -> Vec<StoppableTaskHandle<bool>>
     where
@@ -219,10 +228,18 @@ impl UpdateHandler {
                     }
                     let callback_cloned = callback.clone();
 
+                    let segments = segments.clone();
+                    let preheat_disk_cache_worker = preheat_disk_cache_worker.clone();
+
                     handles.push(spawn_stoppable(move |stopped| {
                         match optim.as_ref().optimize(segs.clone(), nsi, stopped) {
                             Ok(optimized_segment_id) => {
-                                // TODO: Schedule mmap disk-cache preheat, if optimized segment is backed by memmaped storage!
+                                schedule_preheat_disk_cache_task(
+                                    &segments,
+                                    preheat_disk_cache_worker,
+                                    optimized_segment_id,
+                                );
+
                                 callback_cloned(optimized_segment_id.is_some()); // Perform some actions when optimization if finished
                                 optimized_segment_id.is_some()
                             }
@@ -255,12 +272,14 @@ impl UpdateHandler {
     pub(crate) async fn process_optimization(
         optimizers: Arc<Vec<Arc<Optimizer>>>,
         segments: LockedSegmentHolder,
+        preheat_disk_cache_worker: Option<mmap_ops::PreheatDiskCacheHandle>,
         optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
         sender: Sender<OptimizerSignal>,
     ) {
         let mut new_handles = Self::launch_optimization(
             optimizers.clone(),
             segments.clone(),
+            preheat_disk_cache_worker,
             move |_optimization_result| {
                 // After optimization is finished, we still need to check if there are
                 // some further optimizations possible.
@@ -279,6 +298,7 @@ impl UpdateHandler {
         sender: Sender<OptimizerSignal>,
         mut receiver: Receiver<OptimizerSignal>,
         segments: LockedSegmentHolder,
+        preheat_disk_cache_worker: Option<mmap_ops::PreheatDiskCacheHandle>,
         wal: LockedWal,
         optimization_handles: Arc<TokioMutex<Vec<StoppableTaskHandle<bool>>>>,
         max_handles: usize,
@@ -301,9 +321,13 @@ impl UpdateHandler {
                     {
                         continue;
                     }
+
+                    let preheat_disk_cache_worker = preheat_disk_cache_worker.clone();
+
                     Self::process_optimization(
                         optimizers.clone(),
                         segments.clone(),
+                        preheat_disk_cache_worker,
                         optimization_handles.clone(),
                         sender.clone(),
                     )
@@ -445,5 +469,36 @@ impl UpdateHandler {
             None => flushed_version,
             Some(failed_operation) => min(failed_operation, flushed_version),
         })
+    }
+}
+
+fn schedule_preheat_disk_cache_task(
+    segments: &LockedSegmentHolder,
+    preheat_disk_cache_worker: Option<mmap_ops::PreheatDiskCacheHandle>,
+    optimized_segment_id: Option<SegmentId>,
+) {
+    let optimized_segment_id = match optimized_segment_id {
+        Some(id) => id,
+        None => return,
+    };
+
+    let preheat_disk_cache_worker = match preheat_disk_cache_worker {
+        Some(worker) => worker,
+        None => return,
+    };
+
+    let optimized_segment = {
+        let segments = segments.read();
+
+        match segments.get(optimized_segment_id) {
+            Some(LockedSegment::Original(segment)) => segment.clone(),
+            _ => return,
+        }
+    };
+
+    for task in optimized_segment.read().preheat_disk_cache() {
+        if let Err(err) = preheat_disk_cache_worker.schedule(task) {
+            log::error!("{err}");
+        }
     }
 }
